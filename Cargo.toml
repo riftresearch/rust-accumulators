@@ -14,7 +14,7 @@ exclude = [".github", ".vscode"]
 
 [dependencies]
 tokio = { version = "1.33.0", features = ["full"] } # Async runtime
-sqlx = { version = "0.7", features = [
+sqlx = { version = "0.8", features = [
     "runtime-tokio",
     "sqlite",
 ] } # SQLite for rust
