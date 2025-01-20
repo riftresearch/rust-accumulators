@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::hasher::{Hasher, HasherError, HashingFunction};
 use crate::store::{InStoreCounter, InStoreTable, InStoreTableError, Store, StoreError, SubKey};
+use crate::mmr::helpers::leaf_count_to_mmr_size;
 
 use crate::mmr::{
     formatting::{format_peaks, format_proof, PeaksFormattingOptions},
@@ -220,45 +221,46 @@ impl MMR {
         })
     }
 
+
+
     pub async fn rewind(&mut self, leaf_index: usize) -> Result<Vec<String>, MMRError> {
+        // 1) check leaf_index is not out-of-bounds
         let cur_leaf_count = self.leaves_count.get().await?;
-        if leaf_index > cur_leaf_count {
+        if leaf_index >= cur_leaf_count {
             return Err(MMRError::InvalidElementIndex);
         }
 
-        // all leaf indices after the passed leaf index
-        let pruned_leaf_indices: Vec<usize> = ((leaf_index + 1)..cur_leaf_count)
-            .map(|leaf_index| {
-                let element_index = map_leaf_index_to_element_index(leaf_index);
-                element_index
-            })
+        // 2) figure out the MMR size if we want to keep (leaf_index + 1) leaves
+        let new_leaf_count = leaf_index + 1;
+        let new_elements_count = leaf_count_to_mmr_size(new_leaf_count);
+
+        // 3) gather all leaf indexes from [new_leaf_count..cur_leaf_count) 
+        //    (these are the ones we are about to drop)
+        let pruned_leaf_indices: Vec<usize> = (new_leaf_count..cur_leaf_count)
+            .map(|leaf_idx| map_leaf_index_to_element_index(leaf_idx))
             .collect();
 
-        // now collect the leaf hashes for each of these
+        // 4) store their hashes so we can return them
         let pruned_leaf_hashes = self
             .hashes
             .get_many(pruned_leaf_indices.into_iter().map(SubKey::Usize).collect())
             .await?;
 
-        let pre_rewind_elements_count = self.elements_count.get().await?;
+        let old_count = self.elements_count.get().await?;
 
-        let element_index = map_leaf_index_to_element_index(leaf_index);
-
-        let post_rewind_elements_count = element_index;
-        let post_rewind_leaves_count = leaf_index + 1;
-
-        self.elements_count.set(post_rewind_elements_count).await?;
-        // truncate hashes past the element index of the passed leaf
+        // 5) actually wipe everything after `new_elements_count`
         self.hashes
-            .delete_range(post_rewind_elements_count + 1, pre_rewind_elements_count)
+            .delete_range(new_elements_count + 1, old_count)
             .await?;
 
-        // recalculate the root hash
-        let bag = self.bag_the_peaks(Some(post_rewind_elements_count)).await?;
-        let root_hash = self.calculate_root_hash(&bag, post_rewind_elements_count)?;
+        // 6) bag + recalc root
+        let bag = self.bag_the_peaks(Some(new_elements_count)).await?;
+        let root_hash = self.calculate_root_hash(&bag, new_elements_count)?;
         self.root_hash.set(&root_hash, SubKey::None).await?;
 
-        self.leaves_count.set(post_rewind_leaves_count).await?;
+        // 7) set the new counters
+        self.elements_count.set(new_elements_count).await?;
+        self.leaves_count.set(new_leaf_count).await?;
 
         Ok(pruned_leaf_hashes.values().cloned().collect())
     }
