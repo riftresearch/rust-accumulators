@@ -16,7 +16,9 @@ use crate::mmr::{
     },
 };
 
-use super::{FormattingError, PeaksOptions, TreeMetadataKeysError};
+use super::{
+    map_leaf_index_to_element_index, FormattingError, PeaksOptions, TreeMetadataKeysError,
+};
 
 /// An error that can occur when using an MMR
 #[derive(Error, Debug)]
@@ -39,6 +41,8 @@ pub enum MMRError {
     TreeMetadataKeys(#[from] TreeMetadataKeysError),
     #[error("Formatting error: {0}")]
     Formatting(#[from] FormattingError),
+    #[error("Invalid rewind target")]
+    InvalidRewindTarget,
     #[error("No hash found for index {0}")]
     NoHashFoundForIndex(usize),
 }
@@ -214,6 +218,43 @@ impl MMR {
             element_index: leaf_element_index,
             root_hash,
         })
+    }
+
+    pub async fn rewind(&mut self, leaf_index: usize) -> Result<(), MMRError> {
+        if leaf_index > self.leaves_count.get().await? {
+            return Err(MMRError::InvalidElementIndex);
+        }
+
+        let pre_rewind_elements_count = self.elements_count.get().await?;
+
+        let element_index = map_leaf_index_to_element_index(leaf_index);
+
+        let post_rewind_elements_count = element_index;
+        let post_rewind_leaves_count = leaf_index + 1;
+
+        println!("prewind");
+
+        println!("leaves count set");
+        self.elements_count.set(post_rewind_elements_count).await?;
+        println!("elements count set");
+        // truncate hashes past the element index of the passed leaf
+        self.hashes
+            .delete_range(post_rewind_elements_count + 1, pre_rewind_elements_count)
+            .await?;
+        println!("hashes truncated");
+
+        // recalculate the root hash
+        let bag = self.bag_the_peaks(Some(post_rewind_elements_count)).await?;
+        println!("bag the peaks");
+        let root_hash = self.calculate_root_hash(&bag, post_rewind_elements_count)?;
+        println!("root hash calculated");
+        self.root_hash.set(&root_hash, SubKey::None).await?;
+        println!("root hash set");
+
+        // update counters to historical leaf passed
+        self.leaves_count.set(post_rewind_leaves_count).await?;
+
+        Ok(())
     }
 
     pub async fn get_proof(

@@ -5,7 +5,7 @@ use accumulators::{
         keccak::KeccakHasher, stark_pedersen::StarkPedersenHasher,
         stark_poseidon::StarkPoseidonHasher, Hasher,
     },
-    mmr::{AppendResult, PeaksOptions, Proof, ProofOptions, MMR},
+    mmr::{map_leaf_index_to_element_index, AppendResult, PeaksOptions, Proof, ProofOptions, MMR},
     store::{memory::InMemoryStore, sqlite::SQLiteStore, SubKey},
 };
 
@@ -40,6 +40,180 @@ async fn setup() -> (
         (keccak_mmr, append_result_keccak),
         (pedersen_mmr, append_result_pedersen),
     )
+}
+//================================================================================================
+// Tests for rewind
+//================================================================================================
+
+#[tokio::test]
+async fn test_rewind_scenario() {
+    // 1) Set up an MMR with 5 initial leaves (the default in `LEAVES`)
+    let (mut mmr, appended_results) = setup().await.0;
+    // n = 5 leaves
+    let n = appended_results.len();
+    let leaf_index = n - 1;
+
+    // 2) Grab the element index + value for the last leaf
+    let last_leaf_result = appended_results.last().unwrap();
+    let last_leaf_index = last_leaf_result.element_index;
+    // The leaf value is "5" from the global `LEAVES` array
+    let last_leaf_value = LEAVES[LEAVES.len() - 1];
+
+    // 3) Get a proof for the last leaf
+    let original_proof = mmr
+        .get_proof(last_leaf_index, None)
+        .await
+        .expect("Failed to get proof for last leaf");
+
+    println!(
+        "pre addition elements & leaves count: {} {}",
+        mmr.elements_count.get().await.unwrap(),
+        mmr.leaves_count.get().await.unwrap()
+    );
+
+    // 4) Append b=3 new leaves
+    for i in 0..3 {
+        mmr.append(format!("new_leaf_{}", i))
+            .await
+            .expect("Failed to append new leaf");
+    }
+
+    println!(
+        "post addition elements & leaves count: {} {}",
+        mmr.elements_count.get().await.unwrap(),
+        mmr.leaves_count.get().await.unwrap()
+    );
+
+    // 5) Rewind back to when there were n=5 leaves
+    mmr.rewind(leaf_index)
+        .await
+        .expect("Failed to rewind to original size");
+
+    println!("rewind complete");
+    println!(
+        "post rewind elements & leaves count: {} {}",
+        mmr.elements_count.get().await.unwrap(),
+        mmr.leaves_count.get().await.unwrap()
+    );
+
+    // 6) Get that same proof again (for the same leaf index)
+    let rewound_proof = mmr
+        .get_proof(last_leaf_index, None)
+        .await
+        .expect("Failed to get proof after rewinding");
+
+    // 7) Confirm the proof *before* and *after* rewinding are the same
+    assert_eq!(original_proof, rewound_proof);
+
+    // 8) Verify the rewound proof is still valid
+    assert!(mmr
+        .verify_proof(rewound_proof, last_leaf_value.to_string(), None)
+        .await
+        .expect("Failed to verify rewound proof"));
+}
+
+#[tokio::test]
+async fn test_rewind_mid_leaf() {
+    // 1) Set up an MMR with 5 initial leaves
+    let (mut mmr, appended_results) = setup().await.0; // Poseidon again
+                                                       // n = 5
+    let n = appended_results.len();
+
+    // 2) Pick a *middle* leaf, e.g. the 3rd leaf
+    //    appended_results are in insertion order, so index=2 is the 3rd leaf.
+    let mid_leaf_result = &appended_results[2];
+    let mid_leaf_index = mid_leaf_result.element_index;
+    let mid_leaf_value = LEAVES[2]; // "3"
+
+    // 3) Get a proof for that middle leaf
+    let original_proof = mmr
+        .get_proof(mid_leaf_index, None)
+        .await
+        .expect("Failed to get proof for mid leaf");
+
+    // 4) Append b=3 new leaves
+    for i in 0..3 {
+        mmr.append(format!("middle_rewind_leaf_{}", i))
+            .await
+            .expect("Failed to append new leaf");
+    }
+
+    // 5) Rewind back to n=5
+    mmr.rewind(n - 1)
+        .await
+        .expect("Failed to rewind to original size");
+
+    // 6) Get the same leaf's proof again
+    let rewound_proof = mmr
+        .get_proof(mid_leaf_index, None)
+        .await
+        .expect("Failed to get proof after rewinding");
+
+    // 7) Confirm they match
+    assert_eq!(original_proof, rewound_proof);
+
+    // 8) Verify that proof is still valid
+    assert!(mmr
+        .verify_proof(rewound_proof, mid_leaf_value.to_string(), None)
+        .await
+        .expect("Failed to verify rewound proof for mid leaf"));
+}
+
+#[tokio::test]
+async fn test_simulated_proof_generation() {
+    // this test should setup an MMR with n leaves, then create a proof for the nth leaf, then add `b` new leaves, then call the get_proof function with the nth leaf's element index and with the element count as `n` as it was originally generated, then verify these proofs are the same and valid
+    let (mmr, append_result) = setup().await.0;
+    let mut mmr = mmr;
+    let n = append_result.len();
+    let b = 5;
+    let proof = mmr.get_proof(n, None).await.unwrap();
+    mmr.append("6".to_string()).await.unwrap();
+    let proof_post_add = mmr
+        .get_proof(
+            n,
+            Some(ProofOptions {
+                elements_count: Some(map_leaf_index_to_element_index(n - 1)),
+                formatting_opts: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(proof, proof_post_add);
+}
+
+#[tokio::test]
+async fn test_noop_rewind() {
+    // 1) Set up an MMR with 5 initial leaves
+    let (mut mmr, appended_results) = setup().await.0;
+    let n = appended_results.len();
+    let leaf_index = n - 1;
+
+    // Get the current state
+    let original_elements_count = mmr.elements_count.get().await.unwrap();
+    let original_leaves_count = mmr.leaves_count.get().await.unwrap();
+    let original_root = mmr.bag_the_peaks(None).await.unwrap();
+
+    // 2) Rewind to current leaf index (should be a no-op)
+    mmr.rewind(leaf_index)
+        .await
+        .expect("Failed to perform no-op rewind");
+
+    // 3) Verify nothing changed
+    assert_eq!(
+        mmr.elements_count.get().await.unwrap(),
+        original_elements_count,
+        "Elements count should not change after no-op rewind"
+    );
+    assert_eq!(
+        mmr.leaves_count.get().await.unwrap(),
+        original_leaves_count,
+        "Leaves count should not change after no-op rewind"
+    );
+    assert_eq!(
+        mmr.bag_the_peaks(None).await.unwrap(),
+        original_root,
+        "Root hash should not change after no-op rewind"
+    );
 }
 
 //================================================================================================

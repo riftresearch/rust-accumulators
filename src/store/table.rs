@@ -158,6 +158,17 @@ impl InStoreTable {
         Ok(store.get(&full_key).await.unwrap_or_default())
     }
 
+    /// Efficiently clear the underlying store of all usize keys in a range
+    pub async fn delete_range(&self, start: usize, end: usize) -> Result<(), InStoreTableError> {
+        let deleted_keys: Vec<String> = (start..end)
+            .map(|i| InStoreTable::get_full_key(&self.key, &i.to_string()))
+            .collect();
+        self.store
+            .delete_many(deleted_keys.iter().map(|s| s.as_str()).collect())
+            .await?;
+        Ok(())
+    }
+
     /// Get the values from full keys that retrieved from the sub_keys
     pub async fn get_many(
         &self,
