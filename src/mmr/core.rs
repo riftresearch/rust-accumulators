@@ -220,10 +220,14 @@ impl MMR {
         })
     }
 
-    pub async fn rewind(&mut self, leaf_index: usize) -> Result<(), MMRError> {
-        if leaf_index > self.leaves_count.get().await? {
+    pub async fn rewind(&mut self, leaf_index: usize) -> Result<Vec<usize>, MMRError> {
+        let cur_leaf_count = self.leaves_count.get().await?;
+        if leaf_index > cur_leaf_count {
             return Err(MMRError::InvalidElementIndex);
         }
+
+        // all leaf indices after the passed leaf index
+        let pruned_leaf_indices = (leaf_index + 1)..cur_leaf_count;
 
         let pre_rewind_elements_count = self.elements_count.get().await?;
 
@@ -232,29 +236,20 @@ impl MMR {
         let post_rewind_elements_count = element_index;
         let post_rewind_leaves_count = leaf_index + 1;
 
-        println!("prewind");
-
-        println!("leaves count set");
         self.elements_count.set(post_rewind_elements_count).await?;
-        println!("elements count set");
         // truncate hashes past the element index of the passed leaf
         self.hashes
             .delete_range(post_rewind_elements_count + 1, pre_rewind_elements_count)
             .await?;
-        println!("hashes truncated");
 
         // recalculate the root hash
         let bag = self.bag_the_peaks(Some(post_rewind_elements_count)).await?;
-        println!("bag the peaks");
         let root_hash = self.calculate_root_hash(&bag, post_rewind_elements_count)?;
-        println!("root hash calculated");
         self.root_hash.set(&root_hash, SubKey::None).await?;
-        println!("root hash set");
 
-        // update counters to historical leaf passed
         self.leaves_count.set(post_rewind_leaves_count).await?;
 
-        Ok(())
+        Ok(pruned_leaf_indices.collect())
     }
 
     pub async fn get_proof(

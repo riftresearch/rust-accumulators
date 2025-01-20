@@ -71,8 +71,10 @@ async fn test_rewind_scenario() {
         mmr.leaves_count.get().await.unwrap()
     );
 
+    let new_leaf_count = 3;
+
     // 4) Append b=3 new leaves
-    for i in 0..3 {
+    for i in 0..new_leaf_count {
         mmr.append(format!("new_leaf_{}", i))
             .await
             .expect("Failed to append new leaf");
@@ -85,9 +87,12 @@ async fn test_rewind_scenario() {
     );
 
     // 5) Rewind back to when there were n=5 leaves
-    mmr.rewind(leaf_index)
+    let pruned_leaf_indices = mmr
+        .rewind(leaf_index)
         .await
         .expect("Failed to rewind to original size");
+
+    assert_eq!(pruned_leaf_indices.len(), new_leaf_count);
 
     println!("rewind complete");
     println!(
