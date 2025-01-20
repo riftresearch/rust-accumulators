@@ -220,7 +220,7 @@ impl MMR {
         })
     }
 
-    pub async fn rewind(&mut self, leaf_index: usize) -> Result<Vec<usize>, MMRError> {
+    pub async fn rewind(&mut self, leaf_index: usize) -> Result<Vec<String>, MMRError> {
         let cur_leaf_count = self.leaves_count.get().await?;
         if leaf_index > cur_leaf_count {
             return Err(MMRError::InvalidElementIndex);
@@ -228,6 +228,12 @@ impl MMR {
 
         // all leaf indices after the passed leaf index
         let pruned_leaf_indices = (leaf_index + 1)..cur_leaf_count;
+
+        // now collect the leaf hashes for each of these
+        let pruned_leaf_hashes = self
+            .hashes
+            .get_many(pruned_leaf_indices.into_iter().map(SubKey::Usize).collect())
+            .await?;
 
         let pre_rewind_elements_count = self.elements_count.get().await?;
 
@@ -249,7 +255,7 @@ impl MMR {
 
         self.leaves_count.set(post_rewind_leaves_count).await?;
 
-        Ok(pruned_leaf_indices.collect())
+        Ok(pruned_leaf_hashes.values().cloned().collect())
     }
 
     pub async fn get_proof(
