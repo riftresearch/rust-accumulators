@@ -227,7 +227,12 @@ impl MMR {
         }
 
         // all leaf indices after the passed leaf index
-        let pruned_leaf_indices = (leaf_index + 1)..cur_leaf_count;
+        let pruned_leaf_indices: Vec<usize> = ((leaf_index + 1)..cur_leaf_count)
+            .map(|leaf_index| {
+                let element_index = map_leaf_index_to_element_index(leaf_index);
+                element_index
+            })
+            .collect();
 
         // now collect the leaf hashes for each of these
         let pruned_leaf_hashes = self

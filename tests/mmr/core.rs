@@ -87,12 +87,12 @@ async fn test_rewind_scenario() {
     );
 
     // 5) Rewind back to when there were n=5 leaves
-    let pruned_leaf_indices = mmr
+    let pruned_leaf_hashes = mmr
         .rewind(leaf_index)
         .await
         .expect("Failed to rewind to original size");
 
-    assert_eq!(pruned_leaf_indices.len(), new_leaf_count);
+    assert_eq!(pruned_leaf_hashes.len(), new_leaf_count);
 
     println!("rewind complete");
     println!(
@@ -989,4 +989,56 @@ async fn timestamp_remappers_test() {
 
     let correct_root_hash = "0x32f5a2949cac3d06e854701c5a2a00ed51c0475a31c1bc17cc6d3ec46425e9";
     assert_eq!(correct_root_hash, root_hash);
+}
+
+#[tokio::test]
+async fn test_rewind_pruned_leaves() {
+    use std::collections::HashSet;
+
+    // 1) Set up an MMR with 5 initial leaves (["1", "2", "3", "4", "5"])
+    let (mut mmr, appended_results) = setup().await.0;
+    assert_eq!(appended_results.len(), 5);
+
+    // 2) Append 3 new leaves
+    let new_leaves = ["x0", "x1", "x2"];
+    for leaf in &new_leaves {
+        mmr.append((*leaf).to_string())
+            .await
+            .expect("Failed to append new leaf");
+    }
+
+    // The leaf index for the 5th leaf is 4 (since indexing starts at 0),
+    // so rewinding to 4 effectively prunes leaves #5, #6, and #7
+    let rewind_target = 4;
+
+    // 3) Call rewind(...) and capture which leaves get pruned
+    let pruned_leaf_hashes = mmr
+        .rewind(rewind_target)
+        .await
+        .expect("Failed to rewind MMR");
+
+    // 4) Validate that the returned leaves are exactly our 3 newly appended leaves
+    //    Because the store returns them in a HashMap, there’s no guaranteed order;
+    //    we compare sets to avoid ordering confusion.
+    let expected_set: HashSet<String> = new_leaves.iter().map(|s| s.to_string()).collect();
+    let actual_set: HashSet<String> = pruned_leaf_hashes.into_iter().collect();
+    assert_eq!(
+        expected_set, actual_set,
+        "The pruned leaves should match the newly appended leaves"
+    );
+
+    // 5) Finally, confirm that the MMR is back to having only the original 5 leaves
+    let leaves_count_after = mmr.leaves_count.get().await.unwrap();
+    assert_eq!(leaves_count_after, 5, "We should have 5 leaves now");
+
+    // Optionally, confirm the last leaf's proof is still valid, etc.:
+    let last_leaf_idx = appended_results.last().unwrap().element_index; // index for "5"
+    let proof = mmr.get_proof(last_leaf_idx, None).await.unwrap();
+    let last_leaf_value = LEAVES[LEAVES.len() - 1]; // "5"
+    assert!(
+        mmr.verify_proof(proof, last_leaf_value.to_string(), None)
+            .await
+            .expect("Failed to verify proof"),
+        "The proof for the 5th leaf should remain valid after rewind"
+    );
 }
