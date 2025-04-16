@@ -31,13 +31,17 @@ impl SQLiteStore {
         create_file_if_not_exists: Option<bool>,
         id: Option<&str>,
     ) -> Result<Self, Error> {
+        // 8GB RAM, 4 modern cores, SSD storage
         let options = SqliteConnectOptions::from_str(path)?
             .create_if_missing(create_file_if_not_exists.unwrap_or(false))
             .pragma("synchronous", "NORMAL")
             .pragma("journal_mode", "WAL")
+            // 16MB
             .pragma("cache_size", "-16000")
             .pragma("temp_store", "MEMORY")
-            .pragma("mmap_size", "30000000000")
+            // 2GB
+            .pragma("mmap_size", "2147483648")
+            // 4KB
             .pragma("page_size", "4096")
             .busy_timeout(Duration::from_secs(30));
 
