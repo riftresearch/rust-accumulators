@@ -22,7 +22,8 @@ pub struct SQLiteStore {
 
 //? SQLite's default maximum number of variables per statement is 999.
 //? We use a smaller number to be safe.
-const MAX_VARIABLE_NUMBER: usize = 900;
+// CHANGE BACK TO 900!!!! just for testing
+const MAX_VARIABLE_NUMBER: usize = 990;
 
 impl SQLiteStore {
     pub async fn new(
@@ -34,12 +35,14 @@ impl SQLiteStore {
             .create_if_missing(create_file_if_not_exists.unwrap_or(false))
             .pragma("synchronous", "NORMAL")
             .pragma("journal_mode", "WAL")
-            .pragma("cache_size", "-8000")
+            .pragma("cache_size", "-16000")
             .pragma("temp_store", "MEMORY")
+            .pragma("mmap_size", "30000000000")
+            .pragma("page_size", "4096")
             .busy_timeout(Duration::from_secs(30));
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(10)
+            .max_connections(20)
             .connect_with(options)
             .await?;
 
@@ -53,7 +56,7 @@ impl SQLiteStore {
 
     async fn init(&self) -> Result<(), Error> {
         let pool = self.db.lock().await;
-        
+                
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS store (
                 key TEXT PRIMARY KEY,
