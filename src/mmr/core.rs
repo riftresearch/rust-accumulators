@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
@@ -46,6 +46,8 @@ pub enum MMRError {
     InvalidRewindTarget,
     #[error("No hash found for index {0}")]
     NoHashFoundForIndex(usize),
+    #[error("Batch processing failed")]
+    BatchProcessingFailed,
 }
 
 #[derive(Debug)]
@@ -221,7 +223,94 @@ impl MMR {
         })
     }
 
+    pub async fn batch_append(&mut self, values: Vec<String>) -> Result<Vec<AppendResult>, MMRError> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
 
+        for value in &values {
+            self.hasher.is_element_size_valid(value)?;
+        }
+
+        let initial_elements_count = self.elements_count.get().await?;
+        let initial_leaves_count = self.leaves_count.get().await?;
+        
+        let initial_peaks_idxs = find_peaks(initial_elements_count);
+        let mut current_peaks = self.retrieve_peaks_hashes(initial_peaks_idxs, None).await?;
+        
+        let mut results = Vec::with_capacity(values.len());
+        let mut hashes_to_store = HashMap::with_capacity(values.len() * 2);
+        
+        let mut elements_count = initial_elements_count;
+        let mut leaves_count = initial_leaves_count;
+        
+        for value in values {
+            elements_count += 1;
+            let leaf_element_index = elements_count;
+            hashes_to_store.insert(SubKey::Usize(leaf_element_index), value.clone());
+            current_peaks.push(value);
+            let no_merges = leaf_count_to_append_no_merges(leaves_count);
+            
+            for _ in 0..no_merges {
+                elements_count += 1;
+                
+                let right_hash = match current_peaks.pop() {
+                    Some(hash) => hash,
+                    None => return Err(MMRError::NoHashFoundForIndex(elements_count)),
+                };
+                
+                let left_hash = match current_peaks.pop() {
+                    Some(hash) => hash,
+                    None => return Err(MMRError::NoHashFoundForIndex(elements_count)),
+                };
+                
+                let parent_hash = self.hasher.hash(vec![left_hash, right_hash])?;
+                
+                hashes_to_store.insert(SubKey::Usize(elements_count), parent_hash.clone());
+                current_peaks.push(parent_hash);
+            }
+            
+            leaves_count += 1;
+            
+            let bag = self.bag_the_peaks_in_memory(&current_peaks)?;
+            let root_hash = self.calculate_root_hash(&bag, elements_count)?;
+            
+            results.push(AppendResult {
+                leaves_count,
+                elements_count,
+                element_index: leaf_element_index,
+                root_hash: root_hash.clone(),
+            });
+        }
+        
+        self.hashes.set_many(hashes_to_store).await?;
+        self.elements_count.set(elements_count).await?;
+        self.leaves_count.set(leaves_count).await?;
+        
+        if let Some(last_result) = results.last() {
+            self.root_hash.set(&last_result.root_hash, SubKey::None).await?;
+        }
+        
+        Ok(results)
+    }
+
+    pub fn bag_the_peaks_in_memory(&self, peaks_hashes: &[String]) -> Result<String, MMRError> {
+        match peaks_hashes.len() {
+            0 => Ok("0x0".to_string()),
+            1 => Ok(peaks_hashes[0].clone()),
+            _ => {
+                let mut peaks_hashes = VecDeque::from(peaks_hashes.to_vec());
+                let last = peaks_hashes.pop_back().unwrap();
+                let second_last = peaks_hashes.pop_back().unwrap();
+                
+                let root0 = self.hasher.hash(vec![second_last, last])?;
+                
+                Ok(peaks_hashes.into_iter().rev().fold(root0, |prev, cur| {
+                    self.hasher.hash(vec![cur, prev]).unwrap()
+                }))
+            }
+        }
+    }
 
     pub async fn rewind(&mut self, leaf_index: usize) -> Result<Vec<String>, MMRError> {
         // 1) check leaf_index is not out-of-bounds
@@ -230,9 +319,18 @@ impl MMR {
             return Err(MMRError::InvalidElementIndex);
         }
 
+        if leaf_index == cur_leaf_count - 1 {
+            return Ok(Vec::new());
+        }
+
         // 2) figure out the MMR size if we want to keep (leaf_index + 1) leaves
         let new_leaf_count = leaf_index + 1;
         let new_elements_count = leaf_count_to_mmr_size(new_leaf_count);
+        let old_count = self.elements_count.get().await?;
+
+        if new_elements_count == old_count {
+            return Ok(Vec::new());
+        }
 
         // 3) gather all leaf indexes from [new_leaf_count..cur_leaf_count) 
         //    (these are the ones we are about to drop)
@@ -241,17 +339,23 @@ impl MMR {
             .collect();
 
         // 4) store their hashes so we can return them
-        let pruned_leaf_hashes = self
-            .hashes
-            .get_many(pruned_leaf_indices.into_iter().map(SubKey::Usize).collect())
-            .await?;
-
-        let old_count = self.elements_count.get().await?;
-
-        // 5) actually wipe everything after `new_elements_count`
-        self.hashes
-            .delete_range(new_elements_count + 1, old_count)
-            .await?;
+        let pruned_leaf_hashes = if !pruned_leaf_indices.is_empty() {
+            let sub_keys: Vec<SubKey> = pruned_leaf_indices
+                .iter()
+                .map(|&idx| SubKey::Usize(idx))
+                .collect();
+            
+            let hashes_map = self.hashes.get_many(sub_keys).await?;
+            
+            // 5) actually wipe everything after `new_elements_count`
+            self.hashes
+                .delete_range(new_elements_count + 1, old_count)
+                .await?;
+                
+            hashes_map.values().cloned().collect()
+        } else {
+            Vec::new()
+        };
 
         // 6) bag + recalc root
         let bag = self.bag_the_peaks(Some(new_elements_count)).await?;
@@ -262,7 +366,7 @@ impl MMR {
         self.elements_count.set(new_elements_count).await?;
         self.leaves_count.set(new_leaf_count).await?;
 
-        Ok(pruned_leaf_hashes.values().cloned().collect())
+        Ok(pruned_leaf_hashes)
     }
 
     pub async fn get_proof(
@@ -285,40 +389,41 @@ impl MMR {
         }
 
         let peaks = find_peaks(tree_size);
-
         let siblings = find_siblings(element_index, tree_size)?;
 
         let formatting_opts = options
             .formatting_opts
             .as_ref()
             .map(|opts| opts.peaks.clone());
+            
         let peaks_hashes = self.retrieve_peaks_hashes(peaks, formatting_opts).await?;
 
-        let siblings_hashes = self
+        let mut all_indices = siblings.clone();
+        all_indices.push(element_index);
+        
+        let all_hashes = self
             .hashes
             .get_many(
-                siblings
-                    .clone()
+                all_indices
                     .into_iter()
                     .map(SubKey::Usize)
-                    .collect::<Vec<SubKey>>(),
+                    .collect()
             )
             .await?;
-
+            
+        let element_hash = all_hashes
+            .get(&element_index.to_string())
+            .cloned()
+            .ok_or(MMRError::NoHashFoundForIndex(element_index))?;
+            
         let mut siblings_hashes_vec: Vec<String> = siblings
             .iter()
-            .filter_map(|&idx| siblings_hashes.get(&idx.to_string()).cloned())
+            .filter_map(|&idx| all_hashes.get(&idx.to_string()).cloned()) // Note the conversion here
             .collect();
 
         if let Some(formatting_opts) = options.formatting_opts.as_ref() {
             siblings_hashes_vec = format_proof(siblings_hashes_vec, formatting_opts.proof.clone())?;
         }
-
-        let element_hash = self
-            .hashes
-            .get(SubKey::Usize(element_index))
-            .await?
-            .ok_or(MMRError::NoHashFoundForIndex(element_index))?;
 
         Ok(Proof {
             element_index,
@@ -334,6 +439,10 @@ impl MMR {
         elements_indexes: Vec<usize>,
         options: Option<ProofOptions>,
     ) -> Result<Vec<Proof>, MMRError> {
+        if elements_indexes.is_empty() {
+            return Ok(Vec::new());
+        }
+        
         let options = options.unwrap_or_default();
         let tree_size = match options.elements_count {
             Some(count) => count,
@@ -341,10 +450,7 @@ impl MMR {
         };
 
         for &element_index in &elements_indexes {
-            if element_index == 0 {
-                return Err(MMRError::InvalidElementIndex);
-            }
-            if element_index > tree_size {
+            if element_index == 0 || element_index > tree_size {
                 return Err(MMRError::InvalidElementIndex);
             }
         }
@@ -352,40 +458,49 @@ impl MMR {
         let peaks = find_peaks(tree_size);
         let peaks_hashes = self.retrieve_peaks_hashes(peaks, None).await?;
 
+        let mut all_indices = HashSet::new();
         let mut siblings_per_element = HashMap::new();
+        
         for &element_id in &elements_indexes {
-            siblings_per_element.insert(element_id, find_siblings(element_id, tree_size)?);
+            let siblings = find_siblings(element_id, tree_size)?;
+            siblings_per_element.insert(element_id, siblings.clone());
+            
+            all_indices.insert(element_id);
+            for &sibling in &siblings {
+                all_indices.insert(sibling);
+            }
         }
-        let sibling_hashes_to_get = array_deduplicate(
-            siblings_per_element
-                .values()
-                .flat_map(|x| x.iter().cloned())
-                .collect(),
-        )
-        .into_iter()
-        .map(SubKey::Usize)
-        .collect();
-        let all_siblings_hashes = self.hashes.get_many(sibling_hashes_to_get).await?;
 
-        let elements_ids_str: Vec<SubKey> =
-            elements_indexes.iter().map(|&x| SubKey::Usize(x)).collect();
-        let element_hashes = self.hashes.get_many(elements_ids_str).await?;
+        let all_hash_keys: Vec<SubKey> = all_indices
+            .iter()
+            .copied()
+            .map(SubKey::Usize)
+            .collect();
+            
+        let all_hashes = self.hashes.get_many(all_hash_keys).await?;
 
-        let mut proofs: Vec<Proof> = Vec::new();
+        let mut proofs = Vec::with_capacity(elements_indexes.len());
+        
         for &element_id in &elements_indexes {
+            let element_hash = all_hashes
+                .get(&element_id.to_string())
+                .cloned()
+                .ok_or(MMRError::NoHashFoundForIndex(element_id))?;
+                
             let siblings = siblings_per_element.get(&element_id).unwrap();
+            
             let mut siblings_hashes: Vec<String> = siblings
                 .iter()
-                .map(|s| all_siblings_hashes.get(&s.to_string()).unwrap().clone()) // Note the conversion here
+                .map(|&s| all_hashes.get(&s.to_string()).unwrap().clone())
                 .collect();
 
             if let Some(formatting_opts) = &options.formatting_opts {
-                siblings_hashes = format_proof(siblings_hashes, formatting_opts.proof.clone())?
+                siblings_hashes = format_proof(siblings_hashes, formatting_opts.proof.clone())?;
             }
 
             proofs.push(Proof {
                 element_index: element_id,
-                element_hash: element_hashes.get(&element_id.to_string()).unwrap().clone(),
+                element_hash,
                 siblings_hashes,
                 peaks_hashes: peaks_hashes.clone(),
                 elements_count: tree_size,
@@ -401,11 +516,20 @@ impl MMR {
         element_value: String,
         options: Option<ProofOptions>,
     ) -> Result<bool, MMRError> {
+        let element_index = proof.element_index;
+        if element_index == 0 {
+            return Err(MMRError::InvalidElementIndex);
+        }
+        
         let options = options.unwrap_or_default();
         let tree_size = match options.elements_count {
             Some(count) => count,
             None => self.elements_count.get().await?,
         };
+
+        if element_index > tree_size {
+            return Err(MMRError::InvalidElementIndex);
+        }
 
         let leaf_count = mmr_size_to_leaf_count(tree_size);
         let peaks_count = leaf_count_to_peaks_count(leaf_count);
@@ -418,32 +542,8 @@ impl MMR {
             let proof_format_null_value = &formatting_opts.proof.null_value;
             let peaks_format_null_value = &formatting_opts.peaks.null_value;
 
-            let proof_null_values_count = proof
-                .siblings_hashes
-                .iter()
-                .filter(|&s| s == proof_format_null_value)
-                .count();
-            proof
-                .siblings_hashes
-                .truncate(proof.siblings_hashes.len() - proof_null_values_count);
-
-            let peaks_null_values_count = proof
-                .peaks_hashes
-                .iter()
-                .filter(|&s| s == peaks_format_null_value)
-                .count();
-            proof
-                .peaks_hashes
-                .truncate(proof.peaks_hashes.len() - peaks_null_values_count);
-        }
-        let element_index = proof.element_index;
-
-        if element_index == 0 {
-            return Err(MMRError::InvalidElementIndex);
-        }
-
-        if element_index > tree_size {
-            return Err(MMRError::InvalidElementIndex);
+            proof.siblings_hashes.retain(|s| s != proof_format_null_value);
+            proof.peaks_hashes.retain(|s| s != peaks_format_null_value);
         }
 
         let (peak_index, peak_height) = get_peak_info(tree_size, element_index);
@@ -451,25 +551,27 @@ impl MMR {
             return Ok(false);
         }
 
-        let mut hash = element_value.clone();
+        let mut hash = element_value;
         let mut leaf_index = element_index_to_leaf_index(element_index)?;
 
-        for proof_hash in proof.siblings_hashes.iter() {
+        for proof_hash in &proof.siblings_hashes {
             let is_right = leaf_index % 2 == 1;
             leaf_index /= 2;
 
-            hash = self.hasher.hash(if is_right {
-                vec![proof_hash.clone(), hash.clone()]
+            hash = if is_right {
+                self.hasher.hash(vec![proof_hash.clone(), hash])?
             } else {
-                vec![hash.clone(), proof_hash.clone()]
-            })?;
+                self.hasher.hash(vec![hash, proof_hash.clone()])?
+            };
         }
 
-        let peak_hashes = self
-            .retrieve_peaks_hashes(find_peaks(tree_size), None)
-            .await?;
+        let peak_hashes = if !proof.peaks_hashes.is_empty() {
+            proof.peaks_hashes
+        } else {
+            self.retrieve_peaks_hashes(find_peaks(tree_size), None).await?
+        };
 
-        Ok(peak_hashes[peak_index] == hash)
+        Ok(peak_index < peak_hashes.len() && peak_hashes[peak_index] == hash)
     }
 
     pub async fn get_peaks(&self, option: PeaksOptions) -> Result<Vec<String>, MMRError> {
@@ -480,11 +582,9 @@ impl MMR {
 
         let peaks_idxs = find_peaks(tree_size);
         let peaks = self.retrieve_peaks_hashes(peaks_idxs, None).await?;
-        if (option.formatting_opts).is_some() {
-            match format_peaks(peaks, &option.formatting_opts.unwrap()) {
-                Ok(peaks) => Ok(peaks),
-                Err(e) => Err(MMRError::Formatting(e)),
-            }
+        
+        if let Some(formatting_opts) = option.formatting_opts {
+            format_peaks(peaks, &formatting_opts).map_err(MMRError::Formatting)
         } else {
             Ok(peaks)
         }
@@ -495,21 +595,20 @@ impl MMR {
         peak_idxs: Vec<usize>,
         formatting_opts: Option<PeaksFormattingOptions>,
     ) -> Result<Vec<String>, MMRError> {
-        let hashes_result = self
-            .hashes
-            .get_many(peak_idxs.clone().into_iter().map(SubKey::Usize).collect())
-            .await?;
+        if peak_idxs.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        let sub_keys: Vec<SubKey> = peak_idxs.iter().map(|&idx| SubKey::Usize(idx)).collect();
+        let hashes_result = self.hashes.get_many(sub_keys).await?;
         // Assuming hashes_result is a HashMap<String, String>
         let hashes: Vec<String> = peak_idxs
             .iter()
             .filter_map(|&idx| hashes_result.get(&idx.to_string()).cloned())
             .collect();
-
+            
         match formatting_opts {
-            Some(opts) => match format_peaks(hashes, &opts) {
-                Ok(peaks) => Ok(peaks),
-                Err(e) => Err(MMRError::Formatting(e)),
-            },
+            Some(opts) => format_peaks(hashes, &opts).map_err(MMRError::Formatting),
             None => Ok(hashes),
         }
     }
@@ -519,25 +618,20 @@ impl MMR {
             Some(count) => count,
             None => self.elements_count.get().await?,
         };
+        
         let peaks_idxs = find_peaks(tree_size);
-
-        let peaks_hashes = self.retrieve_peaks_hashes(peaks_idxs.clone(), None).await?;
-
-        match peaks_idxs.len() {
-            // Use original peaks_idxs here
-            0 => Ok("0x0".to_string()),
-            1 => Ok(peaks_hashes[0].clone()),
-            _ => {
-                let mut peaks_hashes: VecDeque<String> = peaks_hashes.into();
-                let last = peaks_hashes.pop_back().unwrap();
-                let second_last = peaks_hashes.pop_back().unwrap();
-                let root0 = self.hasher.hash(vec![second_last, last])?;
-
-                Ok(peaks_hashes.into_iter().rev().fold(root0, |prev, cur| {
-                    self.hasher.hash(vec![cur, prev]).unwrap()
-                }))
-            }
+        if peaks_idxs.is_empty() {
+            return Ok("0x0".to_string());
         }
+        
+        if peaks_idxs.len() == 1 {
+            // Use original peaks_idxs here
+            return self.hashes.get(SubKey::Usize(peaks_idxs[0])).await?
+                .ok_or(MMRError::NoHashFoundForIndex(peaks_idxs[0]));
+        }
+
+        let peaks_hashes = self.retrieve_peaks_hashes(peaks_idxs, None).await?;
+        self.bag_the_peaks_in_memory(&peaks_hashes)
     }
 
     pub fn calculate_root_hash(
@@ -545,12 +639,8 @@ impl MMR {
         bag: &str,
         elements_count: usize,
     ) -> Result<String, MMRError> {
-        match self
-            .hasher
+        self.hasher
             .hash(vec![elements_count.to_string(), bag.to_string()])
-        {
-            Ok(root_hash) => Ok(root_hash),
-            Err(e) => Err(MMRError::Hasher(e)),
-        }
+            .map_err(MMRError::Hasher)
     }
 }
