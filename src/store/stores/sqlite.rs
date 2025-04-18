@@ -1,7 +1,12 @@
 use async_trait::async_trait;
 use sqlx::Error;
-use sqlx::{sqlite::SqliteConnectOptions, Pool, Row, Sqlite, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    Pool, Row, Sqlite, SqlitePool,
+};
 use std::collections::HashMap;
+use std::str::FromStr;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::store::StoreError;
@@ -25,14 +30,24 @@ impl SQLiteStore {
         create_file_if_not_exists: Option<bool>,
         id: Option<&str>,
     ) -> Result<Self, Error> {
-        let pool = if let Some(create_file_if_not_exists) = create_file_if_not_exists {
-            let options = SqliteConnectOptions::new()
-                .filename(path)
-                .create_if_missing(create_file_if_not_exists);
-            SqlitePool::connect_with(options).await?
-        } else {
-            SqlitePool::connect(path).await?
-        };
+        // 8GB RAM, 4 modern cores, SSD storage
+        let options = SqliteConnectOptions::from_str(path)?
+            .create_if_missing(create_file_if_not_exists.unwrap_or(false))
+            .pragma("synchronous", "NORMAL")
+            .pragma("journal_mode", "WAL")
+            // 16MB
+            .pragma("cache_size", "-16000")
+            .pragma("temp_store", "MEMORY")
+            // 2GB
+            .pragma("mmap_size", "2147483648")
+            // 4KB
+            .pragma("page_size", "4096")
+            .busy_timeout(Duration::from_secs(30));
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(20)
+            .connect_with(options)
+            .await?;
 
         let store = SQLiteStore {
             id: id.map(|v| v.to_string()),
@@ -44,6 +59,7 @@ impl SQLiteStore {
 
     async fn init(&self) -> Result<(), Error> {
         let pool = self.db.lock().await;
+                
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS store (
                 key TEXT PRIMARY KEY,
@@ -52,6 +68,11 @@ impl SQLiteStore {
         )
         .execute(&*pool)
         .await?;
+        
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_store_key ON store (key);")
+            .execute(&*pool)
+            .await?;
+        
         Ok(())
     }
 }
@@ -79,8 +100,12 @@ impl Store for SQLiteStore {
     }
 
     async fn get_many(&self, keys: Vec<&str>) -> Result<HashMap<String, String>, StoreError> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        
         let pool = self.db.lock().await;
-        let mut map = HashMap::new();
+        let mut map = HashMap::with_capacity(keys.len());
 
         for key_chunk in keys.chunks(MAX_VARIABLE_NUMBER) {
             let placeholders = key_chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
@@ -118,13 +143,17 @@ impl Store for SQLiteStore {
     }
 
     async fn set_many(&self, entries: HashMap<String, String>) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        
         let pool = self.db.lock().await;
         let mut transaction = pool.begin().await?;
 
         for entry_chunk in entries
             .iter()
             .collect::<Vec<_>>()
-            .chunks(MAX_VARIABLE_NUMBER)
+            .chunks(MAX_VARIABLE_NUMBER / 2)
         {
             let mut query = String::from("INSERT OR REPLACE INTO store (key, value) VALUES ");
             let placeholders = entry_chunk
@@ -157,7 +186,12 @@ impl Store for SQLiteStore {
     }
 
     async fn delete_many(&self, keys: Vec<&str>) -> Result<(), StoreError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        
         let pool = self.db.lock().await;
+        let mut transaction = pool.begin().await?;
 
         for key_chunk in keys.chunks(MAX_VARIABLE_NUMBER) {
             let placeholders = key_chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
@@ -169,9 +203,10 @@ impl Store for SQLiteStore {
                 query = query.bind(*key);
             }
 
-            query.execute(&*pool).await?;
+            query.execute(&mut *transaction).await?;
         }
 
+        transaction.commit().await?;
         Ok(())
     }
 }

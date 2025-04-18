@@ -1042,3 +1042,356 @@ async fn test_rewind_pruned_leaves() {
         "The proof for the 5th leaf should remain valid after rewind"
     );
 }
+
+#[cfg(test)]
+mod batch_operations_tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use accumulators::{
+        hasher::{
+            keccak::KeccakHasher, stark_pedersen::StarkPedersenHasher,
+            stark_poseidon::StarkPoseidonHasher,
+        },
+        mmr::MMR,
+        store::{memory::InMemoryStore, sqlite::SQLiteStore, SubKey},
+    };
+
+    async fn setup_mmrs() -> (MMR, MMR, MMR) {
+        let store = Arc::new(InMemoryStore::default());
+        
+        let poseidon_hasher = Arc::new(StarkPoseidonHasher::new(Some(false)));
+        let keccak_hasher = Arc::new(KeccakHasher::new());
+        let pedersen_hasher = Arc::new(StarkPedersenHasher::new());
+        
+        let poseidon_mmr = MMR::new(store.clone(), poseidon_hasher, None);
+        let keccak_mmr = MMR::new(store.clone(), keccak_hasher, None);
+        let pedersen_mmr = MMR::new(store.clone(), pedersen_hasher, None);
+        
+        (poseidon_mmr, keccak_mmr, pedersen_mmr)
+    }
+    
+    #[tokio::test]
+    async fn test_batch_append_basic() {
+        let (mut poseidon_mmr, _, _) = setup_mmrs().await;
+        
+        let leaves = vec![
+            "1".to_string(),
+            "2".to_string(),
+            "3".to_string(),
+            "4".to_string(),
+            "5".to_string()
+        ];
+        
+        let results = poseidon_mmr.batch_append(leaves.clone()).await.unwrap();
+        
+        assert_eq!(results.len(), 5, "Should return 5 result objects");
+        assert_eq!(poseidon_mmr.leaves_count.get().await.unwrap(), 5, "Should have 5 leaves");
+        assert_eq!(results[0].element_index, 1, "First element index should be 1");
+        
+        for i in 1..results.len() {
+            assert!(results[i].element_index > results[i-1].element_index, 
+                "Element indices should be increasing");
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_batch_append_matches_individual_appends() {
+        let (mut batch_mmr, _, _) = setup_mmrs().await;
+        let (mut individual_mmr, _, _) = setup_mmrs().await;
+        
+        let leaves = vec![
+            "1".to_string(),
+            "2".to_string(),
+            "3".to_string(),
+            "4".to_string(),
+            "5".to_string()
+        ];
+        
+        let batch_results = batch_mmr.batch_append(leaves.clone()).await.unwrap();
+        
+        let mut individual_results = Vec::new();
+        for leaf in &leaves {
+            individual_results.push(individual_mmr.append(leaf.clone()).await.unwrap());
+        }
+        
+        assert_eq!(
+            batch_mmr.leaves_count.get().await.unwrap(),
+            individual_mmr.leaves_count.get().await.unwrap(),
+            "Leaf counts should match"
+        );
+        
+        assert_eq!(
+            batch_mmr.elements_count.get().await.unwrap(),
+            individual_mmr.elements_count.get().await.unwrap(),
+            "Element counts should match"
+        );
+        
+        let batch_root = batch_mmr.root_hash.get(SubKey::None).await.unwrap();
+        let individual_root = individual_mmr.root_hash.get(SubKey::None).await.unwrap();
+        assert_eq!(batch_root, individual_root, "Root hashes should match");
+        
+        for (batch_result, individual_result) in batch_results.iter().zip(individual_results.iter()) {
+            assert_eq!(batch_result.element_index, individual_result.element_index, "Element indices should match");
+            assert_eq!(batch_result.leaves_count, individual_result.leaves_count, "Leaf counts should match");
+            assert_eq!(batch_result.elements_count, individual_result.elements_count, "Element counts should match");
+            assert_eq!(batch_result.root_hash, individual_result.root_hash, "Root hashes should match");
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_batch_append_proof_validation() {
+        let (mut mmr, _, _) = setup_mmrs().await;
+        
+        let leaves = vec![
+            "1".to_string(),
+            "2".to_string(),
+            "3".to_string(),
+            "4".to_string(),
+            "5".to_string()
+        ];
+        
+        let results = mmr.batch_append(leaves.clone()).await.unwrap();
+        
+        for (i, result) in results.iter().enumerate() {
+            let proof = mmr.get_proof(result.element_index, None).await.unwrap();
+            let is_valid = mmr.verify_proof(proof, leaves[i].clone(), None).await.unwrap();
+            
+            assert!(is_valid, "Proof for leaf {} should be valid", i);
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_batch_append_empty() {
+        let (mut mmr, _, _) = setup_mmrs().await;
+        
+        let results = mmr.batch_append(Vec::new()).await.unwrap();
+        
+        assert!(results.is_empty(), "Empty batch should return empty results");
+        assert_eq!(mmr.leaves_count.get().await.unwrap(), 0, "Leaf count should remain 0");
+        assert_eq!(mmr.elements_count.get().await.unwrap(), 0, "Element count should remain 0");
+    }
+    
+    #[tokio::test]
+    async fn test_batch_append_single_item() {
+        let (mut batch_mmr, _, _) = setup_mmrs().await;
+        let (mut individual_mmr, _, _) = setup_mmrs().await;
+        
+        let leaf = "single_item".to_string();
+        let batch_results = batch_mmr.batch_append(vec![leaf.clone()]).await.unwrap();
+        let individual_result = individual_mmr.append(leaf.clone()).await.unwrap();
+        
+        assert_eq!(batch_results.len(), 1, "Should have 1 result");
+        assert_eq!(
+            batch_results[0].element_index,
+            individual_result.element_index,
+            "Element indices should match"
+        );
+        assert_eq!(
+            batch_results[0].root_hash,
+            individual_result.root_hash,
+            "Root hashes should match"
+        );
+    }
+    
+    #[tokio::test]
+    async fn test_batch_append_performance() {
+        let (mut batch_mmr, _, _) = setup_mmrs().await;
+        let (mut individual_mmr, _, _) = setup_mmrs().await;
+        
+        let leaf_count = 100;
+        let leaves: Vec<String> = (0..leaf_count)
+            .map(|i| format!("leaf_{}", i))
+            .collect();
+        
+        let batch_start = Instant::now();
+        let _ = batch_mmr.batch_append(leaves.clone()).await.unwrap();
+        let batch_duration = batch_start.elapsed();
+        
+        let individual_start = Instant::now();
+        for leaf in &leaves {
+            let _ = individual_mmr.append(leaf.clone()).await.unwrap();
+        }
+        let individual_duration = individual_start.elapsed();
+        
+        println!("Batch append time: {:?}", batch_duration);
+        println!("Individual append time: {:?}", individual_duration);
+        
+        assert_eq!(batch_mmr.leaves_count.get().await.unwrap(), leaf_count, "Batch MMR should have correct leaf count");
+        assert_eq!(individual_mmr.leaves_count.get().await.unwrap(), leaf_count, "Individual MMR should have correct leaf count");
+    }
+    
+    #[tokio::test]
+    async fn test_batch_append_with_existing_leaves() {
+        let (mut mmr, _, _) = setup_mmrs().await;
+        
+        let initial_leaves = vec!["initial_1".to_string(), "initial_2".to_string()];
+        for leaf in &initial_leaves {
+            mmr.append(leaf.clone()).await.unwrap();
+        }
+        
+        let initial_leaf_count = mmr.leaves_count.get().await.unwrap();
+        assert_eq!(initial_leaf_count, 2, "Should have 2 initial leaves");
+        
+        let batch_leaves = vec!["batch_1".to_string(), "batch_2".to_string(), "batch_3".to_string()];
+        let results = mmr.batch_append(batch_leaves.clone()).await.unwrap();
+        
+        let final_leaf_count = mmr.leaves_count.get().await.unwrap();
+        assert_eq!(final_leaf_count, 5, "Should have 5 total leaves");
+        
+        let initial_proof = mmr.get_proof(1, None).await.unwrap();
+        let is_valid_initial = mmr.verify_proof(initial_proof, initial_leaves[0].clone(), None).await.unwrap();
+        assert!(is_valid_initial, "Proof for initial leaf should be valid");
+        
+        let batch_proof = mmr.get_proof(results[1].element_index, None).await.unwrap();
+        let is_valid_batch = mmr.verify_proof(batch_proof, batch_leaves[1].clone(), None).await.unwrap();
+        assert!(is_valid_batch, "Proof for batch leaf should be valid");
+    }
+    
+    #[tokio::test]
+    async fn test_batch_append_all_hashers() {
+        let (mut poseidon_mmr, mut keccak_mmr, mut pedersen_mmr) = setup_mmrs().await;
+        
+        let leaves = vec![
+            "1".to_string(),
+            "2".to_string(),
+            "3".to_string(),
+            "4".to_string(),
+            "5".to_string()
+        ];
+        
+        let poseidon_results = poseidon_mmr.batch_append(leaves.clone()).await.unwrap();
+        let keccak_results = keccak_mmr.batch_append(leaves.clone()).await.unwrap();
+        let pedersen_results = pedersen_mmr.batch_append(leaves.clone()).await.unwrap();
+        
+        assert_eq!(poseidon_mmr.leaves_count.get().await.unwrap(), 5);
+        assert_eq!(keccak_mmr.leaves_count.get().await.unwrap(), 5);
+        assert_eq!(pedersen_mmr.leaves_count.get().await.unwrap(), 5);
+        
+        let poseidon_root = poseidon_results.last().unwrap().root_hash.clone();
+        let keccak_root = keccak_results.last().unwrap().root_hash.clone();
+        let pedersen_root = pedersen_results.last().unwrap().root_hash.clone();
+        
+        assert_ne!(poseidon_root, keccak_root, "Different hashers should produce different roots");
+        assert_ne!(poseidon_root, pedersen_root, "Different hashers should produce different roots");
+        assert_ne!(keccak_root, pedersen_root, "Different hashers should produce different roots");
+    }
+    
+    #[tokio::test]
+    async fn test_batch_append_with_sqlite() {
+        let store = SQLiteStore::new(":memory:", Some(true), Some("test"))
+            .await
+            .unwrap();
+        let store = Arc::new(store);
+        let hasher = Arc::new(StarkPoseidonHasher::new(Some(false)));
+        
+        let mut mmr = MMR::new(store, hasher, None);
+        
+        let leaves = vec![
+            "1".to_string(),
+            "2".to_string(),
+            "3".to_string(),
+            "4".to_string(),
+            "5".to_string()
+        ];
+        
+        let results = mmr.batch_append(leaves.clone()).await.unwrap();
+        
+        assert_eq!(mmr.leaves_count.get().await.unwrap(), 5, "Should have 5 leaves");
+        
+        for (i, result) in results.iter().enumerate() {
+            let proof = mmr.get_proof(result.element_index, None).await.unwrap();
+            let is_valid = mmr.verify_proof(proof, leaves[i].clone(), None).await.unwrap();
+            
+            assert!(is_valid, "Proof for leaf {} should be valid with SQLite store", i);
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_bag_the_peaks_in_memory() {
+        let (mmr, _, _) = setup_mmrs().await;
+        
+        // let leaves = vec![
+        //     "1".to_string(),
+        //     "2".to_string(),
+        //     "3".to_string(),
+        //     "4".to_string(),
+        //     "5".to_string()
+        // ];
+        
+        // let results = mmr.batch_append(leaves.clone()).await.unwrap();
+        
+        let peaks_from_storage = mmr.get_peaks(accumulators::mmr::PeaksOptions {
+            elements_count: None,
+            formatting_opts: None,
+        }).await.unwrap();
+        
+        let bagged_peaks_from_storage = mmr.bag_the_peaks(None).await.unwrap();
+        let bagged_peaks_in_memory = mmr.bag_the_peaks_in_memory(&peaks_from_storage).unwrap();
+        
+        assert_eq!(
+            bagged_peaks_from_storage, 
+            bagged_peaks_in_memory,
+            "In-memory and storage-based peak bagging should match"
+        );
+    }
+    
+    #[tokio::test]
+    async fn test_rewind_after_batch_append() {
+        let (mut mmr, _, _) = setup_mmrs().await;
+        
+        let first_batch = vec![
+            "1".to_string(),
+            "2".to_string(),
+            "3".to_string(),
+        ];
+        
+        mmr.batch_append(first_batch.clone()).await.unwrap();
+        
+        let root_after_first = mmr.root_hash.get(SubKey::None).await.unwrap().unwrap();
+        
+        let second_batch = vec![
+            "4".to_string(),
+            "5".to_string(),
+        ];
+        
+        mmr.batch_append(second_batch.clone()).await.unwrap();
+        
+        assert_eq!(mmr.leaves_count.get().await.unwrap(), 5, "Should have 5 leaves before rewind");
+        
+        let pruned = mmr.rewind(2).await.unwrap();
+        
+        assert_eq!(pruned.len(), 2, "Should have pruned 2 leaves");
+        assert!(pruned.contains(&second_batch[0]), "Should contain first leaf from second batch");
+        assert!(pruned.contains(&second_batch[1]), "Should contain second leaf from second batch");
+        assert_eq!(mmr.leaves_count.get().await.unwrap(), 3, "Should have 3 leaves after rewind");
+        
+        let root_after_rewind = mmr.root_hash.get(SubKey::None).await.unwrap().unwrap();
+        assert_eq!(root_after_first, root_after_rewind, "Root should match state after first batch");
+    }
+    
+    #[tokio::test]
+    async fn test_large_batch_append() {
+        let (mut mmr, _, _) = setup_mmrs().await;
+        
+        const BATCH_SIZE: usize = 1000;
+        let large_batch: Vec<String> = (0..BATCH_SIZE)
+            .map(|i| format!("large_batch_item_{}", i))
+            .collect();
+        
+        let results = mmr.batch_append(large_batch.clone()).await.unwrap();
+        
+        assert_eq!(results.len(), BATCH_SIZE, "Should have results for all items");
+        assert_eq!(mmr.leaves_count.get().await.unwrap(), BATCH_SIZE, "Should have correct leaf count");
+        
+        let indices_to_check = [0, BATCH_SIZE / 2, BATCH_SIZE - 1];
+        
+        for &idx in &indices_to_check {
+            let element_idx = results[idx].element_index;
+            let proof = mmr.get_proof(element_idx, None).await.unwrap();
+            let is_valid = mmr.verify_proof(proof, large_batch[idx].clone(), None).await.unwrap();
+            
+            assert!(is_valid, "Proof for item {} should be valid", idx);
+        }
+    }
+}
