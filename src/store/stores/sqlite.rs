@@ -22,8 +22,7 @@ pub struct SQLiteStore {
 
 //? SQLite's default maximum number of variables per statement is 999.
 //? We use a smaller number to be safe.
-// CHANGE BACK TO 900!!!! just for testing
-const MAX_VARIABLE_NUMBER: usize = 990;
+const MAX_VARIABLE_NUMBER: usize = 900;
 
 impl SQLiteStore {
     pub async fn new(
